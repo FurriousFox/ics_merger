@@ -1,90 +1,146 @@
 import ICAL from "ical.js";
 
-import http from 'node:http';
-import process, { env } from 'node:process';
+import http from "node:http";
+import process, { env } from "node:process";
+import fs from "node:fs";
+import path from "node:path";
+
 
 process.on("uncaughtException", console.error);
 process.on("unhandledRejection", console.error);
 
-if (!env.PORT) {
+type Config = {
+  port: number;
+  host: string;
+
+  urls: Record<string, string[]>;
+};
+
+// Read config
+const CONFIG = path.join(import.meta.dirname, "./config.json");
+const ENV = path.join(import.meta.dirname, "./.env");
+
+const conf: Config = {} as Config;
+function loadConf() {
+  try {
+    console.log("Loading config...");
+    Object.assign(conf, JSON.parse(fs.readFileSync(CONFIG, "utf-8")));
+
+    fs.watchFile("./config.json", (_c, _p) => {
+      console.log("Config has changed, updating...");
+
+      loadConf();
+    });
+  } catch (e) {
+    console.error(`Error loading config.json: ${(e as Error).message}`);
+  }
+}
+function loadEnv() {
+  if (!env.PORT) {
     try {
-        console.log("loading env file");
-        process.loadEnvFile("./.env");
-    } catch (_e) { /* */ }
-    finally {
-        // deno-lint-ignore no-unsafe-finally
-        if (!env.PORT) throw new Error("PORT environment variable not set");
-    }
+      console.log("Loading env...");
+      process.loadEnvFile(ENV);
+    } catch (e) { console.error(e); }
+
+    if (!env.PORT) throw new Error("PORT environment variable not set");
+  }
+
+  conf.port = +env.PORT;
+  conf.host = env.HOST ?? "0.0.0.0";
+
+  conf.urls = Object.fromEntries(
+    Object.keys(env).map((key, _, all) => {
+      const match = key.match(/^CAL(\d*)(_URL)?$/i);
+      if (!match) return undefined;
+      const src = match[0].toUpperCase().replace("_URL", "").concat("_SRC");
+      const matches = all.filter((key) =>
+        key.startsWith(src!.toUpperCase()) &&
+        key.slice(src!.length).match(/^\d*$/)
+      );
+      return [env[key], matches.map((src) => env[src])] as [string, string[]];
+    }).filter((key) => key != undefined),
+  );
 }
 
-const calendars = Object.fromEntries(Object.keys(env).map((e, _f, g) => {
-    const match = e.match(/^CAL(\d*)(_URL)?$/i);
-    const src = match?.[0].replace("_URL", "").concat("_SRC");
-    if (match) {
-        const matches = g.filter(e => e.startsWith(src!) && e.slice(src!.length).match(/^\d*$/));
-        return [env[e], matches.map(src => env[src])] as [string, string[]];
+if (!fs.existsSync(CONFIG) && !fs.existsSync(ENV)) throw new Error("ENVIRONMENT variables or config.json must be set");
+else if (fs.existsSync(CONFIG)) loadConf();
+else loadEnv();
+
+// Start server
+const server: http.Server = http.createServer(async (req, res) => {
+  let sources: string[] = [];
+  switch (Object.keys(conf.urls).includes(req.url!.slice(1))) {
+    case true: {
+      sources = conf.urls[req.url!.slice(1)];
+      break;
     }
-}).filter(e => e != undefined));
-http.createServer(async (req, res) => {
-    let sources: string[] = [];
-    switch (Object.keys(calendars).includes(req.url!.slice(1))) {
-        case true: {
-            sources = calendars[req.url!.slice(1)];
-            break;
-        }
-        default: {
-            res.statusCode = 404;
-            res.end("not found\n");
-            return;
-        };
+    default: {
+      res.statusCode = 404;
+      res.end("not found\n");
+      return;
     }
+  }
 
-    const timezones = [];
-    const events = [];
+  const timezones = [];
+  const events = [];
 
-    for (const idx in sources) {
-        try {
-            const calendar = sources[idx];
-            console.log(`fetching ${calendar}`);
-            const ical = await (await fetch(calendar)).text();
-            const i = ICAL.parse(ical);
-            const ic = new ICAL.Component(i);
+  for (const idx in sources) {
+    try {
+      const calendar = sources[idx];
+      console.log(`fetching ${calendar}`);
+      const ical = await (await fetch(calendar)).text();
+      const i = ICAL.parse(ical);
+      const ic = new ICAL.Component(i);
 
-            timezones.push(...ic.getAllSubcomponents("vtimezone"));
+      timezones.push(...ic.getAllSubcomponents("vtimezone"));
 
-            // solve common ics parsing issues https://github.com/przemub/ics_caldav_sync/pull/20
-            const ic_events = ic.getAllSubcomponents("vevent").filter(component => {
-                const event = new ICAL.Event(component);
-                try { return !event.isRecurring() || event.iterator().next() != null; } catch (_e) { return false; }
-            }).sort((a, b) => +a.hasProperty("recurrence-id") - +b.hasProperty("recurrence-id"));
+      // solve common ics parsing issues https://github.com/przemub/ics_caldav_sync/pull/20
+      const ic_events = ic.getAllSubcomponents("vevent").filter(component => {
+        const event = new ICAL.Event(component);
+        try { return !event.isRecurring() || event.iterator().next() != null; } catch (_e) { return false; }
+      }).sort((a, b) => +a.hasProperty("recurrence-id") - +b.hasProperty("recurrence-id"));
 
-            ic_events.map(component => new ICAL.Event(component)).forEach(event => event.uid = `${idx}-${event.uid}`);
-            events.push(...ic_events);
-        } catch (e) { console.log("error", e); }
-    }
+      ic_events.map(component => new ICAL.Event(component)).forEach(event => event.uid = `${idx}-${event.uid}`);
+      events.push(...ic_events);
+    } catch (e) { console.log("error", e); }
+  }
 
-    const tzs = timezones.map(component => new ICAL.Timezone(component));
-    const tzids = [...new Set(tzs.map(tz => tz.tzid))];
-    const tzcs: ICAL.Component[] = [];
-    for (const tzid of tzids) {
-        const mtzs = tzs.filter(tz => tz.tzid == tzid);
-        if (new Set(mtzs.map(tz => tz.toString())).size !== 1) console.log(`[WARN] not all timezone definitions for ${tzid} are equal, using the first definition`);
-        tzcs.push(mtzs[0].component);
-    }
+  const tzs = timezones.map(component => new ICAL.Timezone(component));
+  const tzids = [...new Set(tzs.map(tz => tz.tzid))];
+  const tzcs: ICAL.Component[] = [];
+  for (const tzid of tzids) {
+    const mtzs = tzs.filter((tz) => tz.tzid == tzid);
+    if (new Set(mtzs.map((tz) => tz.toString())).size !== 1)
+      console.log(`[WARN] not all timezone definitions for ${tzid} are equal, using the first definition`);
 
-    const cal = new ICAL.Component("vcalendar");
-    [
-        ["prodid", {}, "text", "-//ical.js//ical merger//EN"],
-        ["version", {}, "text", "2.0"],
-        ["calscale", {}, "text", "GREGORIAN"],
-        ["method", {}, "text", "PUBLISH"],
-    ].forEach(prop => cal.addProperty(new ICAL.Property(prop)));
-    tzcs.forEach(tz => cal.addSubcomponent(tz));
-    events.forEach(e => cal.addSubcomponent(e));
+    tzcs.push(mtzs[0].component);
+  }
 
-    res.writeHead(200, "OK", {
-        "content-type": "text/calendar; charset=utf-8"
-    });
-    res.write(cal.toString());
-    res.end();
-}).listen(+env.PORT, env.HOST ?? "0.0.0.0", () => console.log(`listening ${env.HOST ?? "0.0.0.0"}:${env.PORT}`));
+  const cal = new ICAL.Component("vcalendar");
+  [
+    ["prodid", {}, "text", "-//ical.js//ical merger//EN"],
+    ["version", {}, "text", "2.0"],
+    ["calscale", {}, "text", "GREGORIAN"],
+    ["method", {}, "text", "PUBLISH"],
+  ].forEach(prop => cal.addProperty(new ICAL.Property(prop)));
+  tzcs.forEach(tz => cal.addSubcomponent(tz));
+  events.forEach(e => cal.addSubcomponent(e));
+
+  res.writeHead(200, "OK", {
+    "content-type": "text/calendar; charset=utf-8",
+  });
+  res.write(cal.toString());
+  res.end();
+});
+
+const listen = () => {
+  if (server.listening) server.close();
+
+  server.listen(
+    conf.port,
+    conf.host,
+    () => console.log(`listening ${conf.host}:${conf.port}`),
+  );
+};
+
+listen();
