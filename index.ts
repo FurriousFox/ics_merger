@@ -25,12 +25,6 @@ function loadConf() {
   try {
     console.log("Loading config...");
     Object.assign(conf, JSON.parse(fs.readFileSync(CONFIG, "utf-8")));
-
-    fs.watchFile("./config.json", (_c, _p) => {
-      console.log("Config has changed, updating...");
-
-      loadConf();
-    });
   } catch (e) {
     console.error(`Error loading config.json: ${(e as Error).message}`);
   }
@@ -63,7 +57,15 @@ function loadEnv() {
 }
 
 if (!fs.existsSync(CONFIG) && !fs.existsSync(ENV)) throw new Error("ENVIRONMENT variables or config.json must be set");
-else if (fs.existsSync(CONFIG)) loadConf();
+else if (fs.existsSync(CONFIG)) {
+  loadConf();
+  fs.watchFile(CONFIG, (_c, _p) => {
+    console.log("Config has changed, updating...");
+
+    loadConf();
+    listen();
+  });
+}
 else loadEnv();
 
 // Start server
