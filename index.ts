@@ -9,6 +9,8 @@ import path from "node:path";
 process.on("uncaughtException", console.error);
 process.on("unhandledRejection", console.error);
 
+const cache = new Map();
+
 type Config = {
   port: number;
   host: string;
@@ -17,8 +19,8 @@ type Config = {
 };
 
 // Read config
-const CONFIG = path.join(import.meta.dirname, "./config.json");
-const ENV = path.join(import.meta.dirname, "./.env");
+const CONFIG = path.join(import.meta.dirname!, "./config.json");
+const ENV = path.join(import.meta.dirname!, "./.env");
 
 const conf: Config = {} as Config;
 function loadConf() {
@@ -87,8 +89,9 @@ const server: http.Server = http.createServer(async (req, res) => {
   const events = [];
 
   for (const idx in sources) {
+    let ic_events: ICAL.Component[] = [];
+    const calendar = sources[idx];
     try {
-      const calendar = sources[idx];
       console.log(`fetching ${calendar}`);
       const ical = await (await fetch(calendar)).text();
       const i = ICAL.parse(ical);
@@ -97,14 +100,22 @@ const server: http.Server = http.createServer(async (req, res) => {
       timezones.push(...ic.getAllSubcomponents("vtimezone"));
 
       // solve common ics parsing issues https://github.com/przemub/ics_caldav_sync/pull/20
-      const ic_events = ic.getAllSubcomponents("vevent").filter(component => {
+      ic_events = ic.getAllSubcomponents("vevent").filter(component => {
         const event = new ICAL.Event(component);
         try { return !event.isRecurring() || event.iterator().next() != null; } catch (_e) { return false; }
       }).sort((a, b) => +a.hasProperty("recurrence-id") - +b.hasProperty("recurrence-id"));
 
       ic_events.map(component => new ICAL.Event(component)).forEach(event => event.uid = `${idx}-${event.uid}`);
-      events.push(...ic_events);
-    } catch (e) { console.log("error", e); }
+      cache.set(calendar, ic_events);
+    } catch (e) {
+      console.log("error", e);
+      if (cache.has(calendar)) {
+        console.log(`using cache for ${calendar}`);
+        ic_events = cache.get(calendar);
+      }
+    }
+
+    events.push(...ic_events);
   }
 
   const tzs = timezones.map(component => new ICAL.Timezone(component));
