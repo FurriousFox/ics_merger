@@ -17,8 +17,8 @@ type Config = {
 };
 
 // Read config
-const CONFIG = path.join(import.meta.dirname, "./config.json");
-const ENV = path.join(import.meta.dirname, "./.env");
+const CONFIG = path.join(import.meta.dirname!, "./config.json");
+const ENV = path.join(import.meta.dirname!, "./.env");
 
 const conf: Config = {} as Config;
 function loadConf() {
@@ -68,6 +68,67 @@ else if (fs.existsSync(CONFIG)) {
 }
 else loadEnv();
 
+// ---
+type Cal = {
+  timezones: ICAL.Component[];
+  events: ICAL.Component[];
+};
+const cache = new Map<string, Cal>();
+async function fetch_cal(calendar: string, idx: string, prefetch: boolean = false) {
+  let timezones: ICAL.Component[] = [];
+  let events: ICAL.Component[] = [];
+
+  if (cache.has(`${idx}:${calendar}`) && !prefetch) {
+    console.log(`reading from cache ${calendar}`);
+    fetch_cal(calendar, idx, true);
+    return cache.get(`${idx}:${calendar}`)!;
+  }
+
+  try {
+    if (!prefetch) console.log(`fetching ${calendar}`);
+    const ical = await (await fetch(calendar)).text();
+    const i = ICAL.parse(ical);
+    const ic = new ICAL.Component(i);
+
+    timezones = ic.getAllSubcomponents("vtimezone");
+
+    // solve common ics parsing issues https://github.com/przemub/ics_caldav_sync/pull/20
+    const ic_events = ic.getAllSubcomponents("vevent").filter(component => {
+      const event = new ICAL.Event(component);
+      try { return !event.isRecurring() || event.iterator().next() != null; } catch (_e) { return false; }
+    }).sort((a, b) => +a.hasProperty("recurrence-id") - +b.hasProperty("recurrence-id"));
+
+    ic_events.map(component => new ICAL.Event(component)).forEach(event => event.uid = `${idx}-${event.uid}`);
+    events = ic_events;
+
+    cache.set(`${idx}:${calendar}`, { timezones, events });
+  } catch (e) {
+    if (!prefetch) console.log("error", e);
+    if (cache.has(`${idx}:${calendar}`)) {
+      if (!prefetch) console.log(`using cache for ${calendar}`);
+      return cache.get(`${idx}:${calendar}`)!;
+    }
+  }
+
+  return { timezones, events };
+}
+async function prefetch() {
+  console.time("prefetch");
+  const f = [];
+  for (const source in conf.urls) {
+    const sources = conf.urls[source];
+    for (const idx in sources) {
+      const calendar = sources[idx];
+      f.push(fetch_cal(calendar, idx, true));
+    }
+  }
+  await Promise.allSettled(f);
+  console.timeEnd("prefetch");
+}
+setInterval(prefetch, 60 * 60 * 1000);
+prefetch();
+// ---
+
 // Start server
 const server: http.Server = http.createServer(async (req, res) => {
   let sources: string[] = [];
@@ -87,24 +148,10 @@ const server: http.Server = http.createServer(async (req, res) => {
   const events = [];
 
   for (const idx in sources) {
-    try {
-      const calendar = sources[idx];
-      console.log(`fetching ${calendar}`);
-      const ical = await (await fetch(calendar)).text();
-      const i = ICAL.parse(ical);
-      const ic = new ICAL.Component(i);
-
-      timezones.push(...ic.getAllSubcomponents("vtimezone"));
-
-      // solve common ics parsing issues https://github.com/przemub/ics_caldav_sync/pull/20
-      const ic_events = ic.getAllSubcomponents("vevent").filter(component => {
-        const event = new ICAL.Event(component);
-        try { return !event.isRecurring() || event.iterator().next() != null; } catch (_e) { return false; }
-      }).sort((a, b) => +a.hasProperty("recurrence-id") - +b.hasProperty("recurrence-id"));
-
-      ic_events.map(component => new ICAL.Event(component)).forEach(event => event.uid = `${idx}-${event.uid}`);
-      events.push(...ic_events);
-    } catch (e) { console.log("error", e); }
+    const calendar = sources[idx];
+    const cal = await fetch_cal(calendar, idx);
+    timezones.push(...cal.timezones);
+    events.push(...cal.events);
   }
 
   const tzs = timezones.map(component => new ICAL.Timezone(component));
